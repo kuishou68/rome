@@ -460,6 +460,65 @@ describe("AnthropicProvider", () => {
       ]);
     });
 
+    const callTool = (id: string, name: string, echo?: string) => ({
+      type: "assistant",
+      session_id: "sdk-thread",
+      parent_tool_use_id: null,
+      uuid: `assistant-${id}`,
+      ...(echo ? { user_message_uuid: echo, user_message_uuids: [echo] } : {}),
+      message: { content: [{ type: "tool_use", id, name, input: {} }] },
+    });
+    const preToolUse = (id: string, name: string) => ({
+      hook_event_name: "PreToolUse",
+      tool_name: name,
+      tool_input: {},
+      tool_use_id: id,
+    });
+    const signal = new AbortController().signal;
+
+    it("denies Rome's turn-bound tools in a turn the SDK started", async () => {
+      const decisions: unknown[] = [];
+      queryMock.mockImplementation(({ prompt, options }) => ({
+        async *[Symbol.asyncIterator]() {
+          const hook = options.hooks.PreToolUse[0].hooks[0];
+          const inputs = prompt[Symbol.asyncIterator]();
+          const first = (await inputs.next()).value;
+          yield { ...first, isReplay: true };
+          yield callTool("toolu_rome", "mcp__actions__send_message", first.uuid);
+          decisions.push(
+            await hook(preToolUse("toolu_rome", "mcp__actions__send_message"), "toolu_rome", {
+              signal,
+            }),
+          );
+          yield result("sent", [first.uuid], "human");
+          // The SDK's own turn: its hook call may come before Rome reads the frame.
+          const early = hook(preToolUse("toolu_sdk", "mcp__output__submit_output"), "toolu_sdk", {
+            signal,
+          });
+          yield callTool("toolu_sdk", "mcp__output__submit_output");
+          decisions.push(await early);
+          decisions.push(await hook(preToolUse("toolu_bash", "Bash"), "toolu_bash", { signal }));
+          yield result("", [], "task-notification");
+        },
+        close: rs.fn(),
+      }));
+      const session = await new AnthropicProvider().openSession(buildParams());
+      await session.sendUserInput({ text: "send it", inputId: a });
+      await collectEvents(session);
+      await session.close();
+
+      expect(decisions).toEqual([
+        {},
+        {
+          hookSpecificOutput: expect.objectContaining({
+            hookEventName: "PreToolUse",
+            permissionDecision: "deny",
+          }),
+        },
+        {},
+      ]);
+    });
+
     it("stamps sends without an inputId and reports no input status for them", async () => {
       const sends: { uuid?: string; origin?: unknown }[] = [];
       scripted(async function* (sent) {
