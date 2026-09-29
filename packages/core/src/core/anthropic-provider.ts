@@ -144,16 +144,6 @@ function isResultSuccess(result: SDKResultMessage): result is SDKResultSuccess {
   return result.subtype === "success";
 }
 
-// Tools of Rome's own MCP servers that act in the open Rome turn: actions
-// (turn id, channel, approvals, interactive cards), ask_user, subagents and
-// submit_output. Skills only read, and external servers hold no Rome turn.
-const ROME_TURN_TOOL_PATTERN = /^mcp__(actions|ask_user|subagents|output)__/;
-
-const SDK_TURN_TOOL_DENIAL =
-  "This turn was started by the Claude Agent SDK for a finished background task, not by a " +
-  "message, so Rome's actions, interactive tools, subagents and output submission are " +
-  "unavailable in it. They are available again once the user sends a message.";
-
 /** The uuids of the sends a frame or result answers (the SDK's echo). */
 function echoedSendIds(message: {
   user_message_uuid?: string;
@@ -557,25 +547,6 @@ export class AnthropicProvider implements ModelProvider {
       resumeReading?.();
       resumeReading = undefined;
     };
-    // Owner of each turn-bound tool call, as its frame was routed. Rome's
-    // turn-bound tools run in the context of the open Rome turn, so a turn
-    // the SDK started must not call them; the PreToolUse hook waits here for
-    // the call's frame, which the SDK streams before it runs the hook.
-    const toolUseOwners = new Map<string, "rome" | "sdk" | undefined>();
-    const toolUseOwnerWaiters = new Map<string, (owner: "rome" | "sdk" | undefined) => void>();
-    const recordToolUseOwner = (id: string, owner: "rome" | "sdk" | undefined) => {
-      const waiter = toolUseOwnerWaiters.get(id);
-      if (waiter) {
-        toolUseOwnerWaiters.delete(id);
-        waiter(owner);
-      } else {
-        toolUseOwners.set(id, owner);
-      }
-    };
-    const releaseToolUseWaiters = () => {
-      for (const waiter of toolUseOwnerWaiters.values()) waiter(undefined);
-      toolUseOwnerWaiters.clear();
-    };
     // A cancelled first turn can leave a user-only transcript that is not
     // resumable. Its id is still reserved by the CLI, so don't reuse it.
     const sdkSessionId =
@@ -601,38 +572,6 @@ export class AnthropicProvider implements ModelProvider {
         // `text_delta` previews while a text block is still being generated.
         includePartialMessages: true,
         extraArgs: { "replay-user-messages": null },
-        hooks: {
-          PreToolUse: [
-            {
-              timeout: 600,
-              hooks: [
-                async (input) => {
-                  if (
-                    input.hook_event_name !== "PreToolUse" ||
-                    !ROME_TURN_TOOL_PATTERN.test(input.tool_name)
-                  ) {
-                    return {};
-                  }
-                  const id = input.tool_use_id;
-                  const owner = toolUseOwners.has(id)
-                    ? toolUseOwners.get(id)
-                    : await new Promise<"rome" | "sdk" | undefined>((resolve) => {
-                        toolUseOwnerWaiters.set(id, resolve);
-                      });
-                  toolUseOwners.delete(id);
-                  if (owner !== "sdk") return {};
-                  return {
-                    hookSpecificOutput: {
-                      hookEventName: "PreToolUse",
-                      permissionDecision: "deny",
-                      permissionDecisionReason: SDK_TURN_TOOL_DENIAL,
-                    },
-                  };
-                },
-              ],
-            },
-          ],
-        },
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
         settingSources: ["project"],
@@ -701,11 +640,18 @@ export class AnthropicProvider implements ModelProvider {
           if (owner !== sdkTurnOwner) {
             sdkTurnOwner = owner;
             if (owner === "rome" && !running && !closed) {
-              log.info("pausing SDK stream until Rome opens a turn for a queued send");
+              const inputId = isUserMessage(message)
+                ? message.uuid
+                : isAssistantMessage(message) || isPartialAssistantMessage(message)
+                  ? echoedSendIds(message).find((id) => romeSendIds.has(id))
+                  : undefined;
+              log.info("pausing SDK stream until Rome opens a turn for a queued send", {
+                inputId,
+              });
               await new Promise<void>((resolve) => {
                 resumeReading = resolve;
               });
-              log.info("resumed SDK stream");
+              log.info("resumed SDK stream", { inputId });
             }
           }
           // First assistant message means the SDK has written user+assistant
@@ -716,13 +662,6 @@ export class AnthropicProvider implements ModelProvider {
           // started by itself writes the transcript too.
           if (establishedThreadId === undefined && isAssistantMessage(message)) {
             establishedThreadId = message.session_id;
-          }
-          if (isAssistantMessage(message) && message.parent_tool_use_id === null) {
-            for (const block of message.message.content) {
-              if (isToolUseBlock(block) && ROME_TURN_TOOL_PATTERN.test(block.name)) {
-                recordToolUseOwner(block.id, sdkTurnOwner);
-              }
-            }
           }
           if (sdkTurnOwner === "sdk" && isTurnFrame(message)) continue;
           if (isPartialAssistantMessage(message)) {
@@ -810,7 +749,6 @@ export class AnthropicProvider implements ModelProvider {
             const echoed = echoedSendIds(message).filter((id) => romeSendIds.has(id));
             const ownerAtResult = sdkTurnOwner;
             sdkTurnOwner = undefined;
-            toolUseOwners.clear();
             // A result follows the owner its frames were routed to. A turn with
             // no frames (the empty results of a resumed or batched background
             // task) is the SDK's own when its origin says so.
@@ -1157,7 +1095,6 @@ export class AnthropicProvider implements ModelProvider {
       async interrupt(reason?: string): Promise<void> {
         log.info("ModelSession interrupt requested", { reason });
         openRomeTurn();
-        releaseToolUseWaiters();
         await queryProcess.abort();
         inputQueue.end();
       },
@@ -1165,7 +1102,6 @@ export class AnthropicProvider implements ModelProvider {
         if (queryDisposed) return;
         queryDisposed = true;
         openRomeTurn();
-        releaseToolUseWaiters();
         try {
           inputQueue.end();
         } catch {
